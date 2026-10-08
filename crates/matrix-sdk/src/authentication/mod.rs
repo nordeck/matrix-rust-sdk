@@ -98,7 +98,7 @@ pub(crate) struct AuthCtx {
     pub(crate) auth_data: OnceCell<AuthData>,
 
     /// The current session tokens and their state.
-    tokens: OnceCell<Mutex<SessionTokensState>>,
+    tokens: Mutex<Option<SessionTokensState>>,
 
     /// A callback called whenever we need an absolute source of truth for the
     /// current session tokens.
@@ -124,7 +124,7 @@ impl AuthCtx {
             refresh_token_lock: Arc::new(AsyncMutex::new(Ok(()))),
             session_change_sender: broadcast::Sender::new(1),
             auth_data: OnceCell::default(),
-            tokens: OnceCell::default(),
+            tokens: Mutex::new(None),
             reload_session_callback: OnceCell::default(),
             save_session_callback: OnceCell::default(),
             oauth: OAuthCtx::new(allow_insecure_oauth),
@@ -133,17 +133,17 @@ impl AuthCtx {
 
     /// The current session tokens.
     pub(crate) fn session_tokens(&self) -> Option<SessionTokens> {
-        Some(self.tokens.get()?.lock().inner.clone())
+        Some(self.tokens.lock().as_ref()?.inner.clone())
     }
 
     /// The current access token.
     pub(crate) fn access_token(&self) -> Option<String> {
-        Some(self.tokens.get()?.lock().inner.access_token.clone())
+        Some(self.tokens.lock().as_ref()?.inner.access_token.clone())
     }
 
     /// Whether we have a valid session token.
     pub(crate) fn has_valid_access_token(&self) -> bool {
-        self.tokens.get().is_some_and(|tokens| !tokens.lock().access_token_expired)
+        self.tokens.lock().as_ref().is_some_and(|tokens| !tokens.access_token_expired)
     }
 
     /// Set the current session tokens.
@@ -154,11 +154,16 @@ impl AuthCtx {
             access_token_expired: false,
         };
 
-        if let Some(tokens) = self.tokens.get() {
-            *tokens.lock() = session_tokens;
-        } else {
-            let _ = self.tokens.set(Mutex::new(session_tokens));
-        }
+        *self.tokens.lock() = Some(session_tokens);
+    }
+
+    /// Remove the current session tokens.
+    ///
+    /// This is used to roll back a login that was interrupted or failed after
+    /// the tokens were obtained but before the session was loaded, so that the
+    /// client is left as it was before the login.
+    pub(crate) fn clear_session_tokens(&self) {
+        *self.tokens.lock() = None;
     }
 
     /// Set the given access token as expired.
@@ -166,12 +171,10 @@ impl AuthCtx {
     /// We take the value of the access token to make sure that we don't mark
     /// the wrong access token as expired.
     pub(crate) fn set_access_token_expired(&self, access_token: &str) {
-        if let Some(tokens) = self.tokens.get() {
-            let mut tokens = tokens.lock();
-
-            if tokens.inner.access_token == access_token {
-                tokens.access_token_expired = true;
-            }
+        if let Some(tokens) = self.tokens.lock().as_mut()
+            && tokens.inner.access_token == access_token
+        {
+            tokens.access_token_expired = true;
         }
     }
 }
