@@ -1103,3 +1103,171 @@ async fn test_login_with_device_code_not_registered() {
     assert_matches!(res, Err(DeviceCodeLoginError::NotRegistered));
     assert!(client.session_meta().is_none());
 }
+
+#[async_test]
+async fn test_finish_login_rolls_back_tokens_if_session_is_not_loaded() -> anyhow::Result<()> {
+    let server = MatrixMockServer::new().await;
+    let oauth_server = server.oauth();
+    let server_metadata = oauth_server.server_metadata();
+
+    let client = server.client_builder().registered_with_oauth().build().await;
+    let oauth = client.oauth();
+
+    let redirect_uri = RedirectUrl::new(REDIRECT_URI_STRING.to_owned())?;
+    let insert_state = |state: &str| {
+        let state = CsrfToken::new(state.to_owned());
+        let (_pkce_code_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
+        let auth_validation_data = AuthorizationValidationData {
+            server_metadata: server_metadata.clone(),
+            device_id: owned_device_id!("D3V1C31D"),
+            redirect_uri: redirect_uri.clone(),
+            pkce_verifier,
+        };
+        let oauth = oauth.clone();
+        async move {
+            let data = oauth.data().context("missing data")?;
+            data.authorization_data.lock().await.insert(state.clone(), auth_validation_data);
+            anyhow::Ok(state)
+        }
+    };
+
+    oauth_server.mock_token().ok().expect(2).named("token").mount().await;
+
+    // Loading the session is cancelled while `whoami` is pending.
+    let state1 = insert_state("state1").await?;
+    let slow_whoami_guard = server
+        .mock_who_am_i()
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({
+                    "user_id": "@joe:example.org",
+                    "device_id": "D3V1C31D",
+                }))
+                .set_delay(Duration::from_secs(30)),
+        )
+        .mount_as_scoped()
+        .await;
+
+    let login_task = {
+        let oauth = oauth.clone();
+        spawn(async move {
+            oauth
+                .finish_login(UrlOrQuery::Query(format!("code=42&state={}", state1.secret())))
+                .await
+        })
+    };
+
+    // Wait until the tokens were obtained and `whoami` was requested.
+    while !server
+        .server()
+        .received_requests()
+        .await
+        .context("missing requests")?
+        .iter()
+        .any(|request| request.url.path().ends_with("/account/whoami"))
+    {
+        sleep(Duration::from_millis(10)).await;
+    }
+    assert!(client.session_tokens().is_some(), "the tokens are set while the session is loaded");
+
+    login_task.abort();
+    assert!(login_task.await.is_err());
+
+    // The client is left as it was before the login.
+    assert!(client.session_meta().is_none());
+    assert!(client.session_tokens().is_none());
+
+    // Loading the session fails because `whoami` fails.
+    drop(slow_whoami_guard);
+    server.mock_who_am_i().error500().expect(1).named("whoami_error").mount().await;
+    let state2 = insert_state("state2").await?;
+
+    let res =
+        oauth.finish_login(UrlOrQuery::Query(format!("code=42&state={}", state2.secret()))).await;
+
+    assert_matches!(res, Err(Error::Http(_)));
+    assert!(client.session_meta().is_none());
+    assert!(client.session_tokens().is_none());
+
+    Ok(())
+}
+
+#[async_test]
+async fn test_login_with_device_code_cancelled_while_loading_session() -> anyhow::Result<()> {
+    let server = MatrixMockServer::new().await;
+    let oauth_server = server.oauth();
+
+    oauth_server.mock_server_metadata().ok().expect(1..).mount().await;
+    oauth_server.mock_device_authorization().ok_with_interval(0).expect(2).mount().await;
+    oauth_server.mock_token().ok().expect(2).mount().await;
+
+    // The session can't be loaded until the `whoami` endpoint answers.
+    let slow_whoami_guard = server
+        .mock_who_am_i()
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({
+                    "user_id": "@joe:example.org",
+                    "device_id": "D3V1C31D",
+                }))
+                .set_delay(Duration::from_secs(30)),
+        )
+        .mount_as_scoped()
+        .await;
+
+    let client = server.client_builder().registered_with_oauth().build().await;
+    let oauth = client.oauth();
+
+    let login = oauth.login_with_device_code(Some(owned_device_id!("D3V1C31D")), None, None);
+    let mut progress = login.subscribe_to_progress();
+    let login_task = spawn(login.into_future());
+
+    // Wait until the tokens were obtained and the session is being loaded.
+    loop {
+        let state = progress.next().await.context("progress stream ended too early")?;
+
+        if matches!(state, DeviceCodeLoginProgress::LoadingSession) {
+            break;
+        }
+    }
+    assert!(client.session_tokens().is_some(), "the tokens are set while the session is loaded");
+
+    // Cancel the login.
+    login_task.abort();
+    assert!(login_task.await.is_err());
+
+    // The client is left as it was before the login.
+    assert!(client.session_meta().is_none());
+    assert!(client.session_tokens().is_none());
+
+    // The login can be done again.
+    drop(slow_whoami_guard);
+    server.mock_who_am_i().ok().expect(1).mount().await;
+
+    oauth.login_with_device_code(Some(owned_device_id!("D3V1C31D")), None, None).await?;
+
+    let session_meta = client.session_meta().context("missing session meta")?;
+    assert_eq!(session_meta.device_id, "D3V1C31D");
+    assert!(client.session_tokens().is_some());
+
+    Ok(())
+}
+
+#[async_test]
+async fn test_login_with_device_code_session_load_failure_removes_tokens() {
+    let server = MatrixMockServer::new().await;
+    let oauth_server = server.oauth();
+
+    oauth_server.mock_server_metadata().ok().expect(1).mount().await;
+    oauth_server.mock_device_authorization().ok_with_interval(0).expect(1).mount().await;
+    oauth_server.mock_token().ok().expect(1).mount().await;
+    server.mock_who_am_i().error500().expect(1).mount().await;
+
+    let client = server.client_builder().registered_with_oauth().build().await;
+
+    let res = client.oauth().login_with_device_code(None, None, None).await;
+
+    assert_matches!(res, Err(DeviceCodeLoginError::SessionLoad(_)));
+    assert!(client.session_meta().is_none());
+    assert!(client.session_tokens().is_none());
+}

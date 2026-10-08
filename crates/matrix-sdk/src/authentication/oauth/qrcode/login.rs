@@ -1,4 +1,5 @@
 // Copyright 2024 The Matrix.org Foundation C.I.C.
+// Copyright 2026 Nordeck IT + Consulting GmbH <info@nordeck.net>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -39,7 +40,7 @@ use super::{
 use crate::{
     Client,
     authentication::oauth::{
-        ClientRegistrationData, OAuth, OAuthError,
+        ClientRegistrationData, OAuth, OAuthError, SessionTokensRollback,
         qrcode::{CheckCodeSender, GeneratedQrProgress, LoginProtocolType, QrProgress},
     },
 };
@@ -134,6 +135,11 @@ async fn finish_login<Q>(
         return Err(e.into());
     }
 
+    // The session tokens are now set on the client. Remove them again if the
+    // session can't be set up, or if we are dropped before it is, so that the
+    // client is left as it was before the login.
+    let rollback = SessionTokensRollback::new(client);
+
     // We only received an access token from the OAuth 2.0 authorization server, we
     // have no clue who we are, so we need to figure out our user ID
     // now. TODO: This snippet is almost the same as the
@@ -153,6 +159,7 @@ async fn finish_login<Q>(
         )
         .await
         .map_err(|error| QRCodeLoginError::SessionTokens(error.into()))?;
+    rollback.disarm();
 
     client.oauth().enable_cross_process_lock().await?;
 
@@ -663,6 +670,90 @@ mod test {
             bob.encryption().get_user_identity(bob.user_id().unwrap()).await.unwrap().unwrap();
 
         assert!(own_identity.is_verified());
+    }
+
+    /// If the session can't be set up after the tokens were obtained, the
+    /// tokens are removed again, so the client is left as it was before the
+    /// login.
+    #[async_test]
+    async fn test_qr_login_rolls_back_tokens_if_whoami_fails() {
+        let server = MatrixMockServer::new().await;
+        let rendezvous_server =
+            MockedRendezvousServer::new(server.server(), "abcdEFG12345", Duration::MAX).await;
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+
+        let oauth_server = server.oauth();
+        oauth_server.mock_server_metadata().ok().expect(1).named("server_metadata").mount().await;
+        oauth_server.mock_registration().ok().expect(1).named("registration").mount().await;
+        oauth_server
+            .mock_device_authorization()
+            .ok()
+            .expect(1)
+            .named("device_authorization")
+            .mount()
+            .await;
+        oauth_server.mock_token().ok().expect(1).named("token").mount().await;
+
+        server.mock_versions().ok().expect(1..).named("versions").mount().await;
+        server.mock_who_am_i().error500().expect(1).named("whoami").mount().await;
+        server.mock_upload_keys().ok().expect(0).named("upload_keys").mount().await;
+
+        let client = HttpClient::new(reqwest::Client::new(), Default::default());
+        let alice = SecureChannel::reciprocate(client, &rendezvous_server.homeserver_url)
+            .await
+            .expect("Alice should be able to create a secure channel.");
+
+        assert_let!(
+            QrCodeIntentData::Msc4108 {
+                data: Msc4108IntentData::Reciprocate { server_name },
+                ..
+            } = &alice.qr_code_data().intent_data()
+        );
+
+        let bob = Client::builder()
+            .server_name_or_homeserver_url(server_name)
+            .request_config(RequestConfig::new().disable_retry())
+            .build()
+            .await
+            .expect("We should be able to build the Client object from the URL in the QR code");
+
+        let qr_code = alice.qr_code_data().clone();
+
+        let oauth = bob.oauth();
+        let registration_data = mock_client_metadata().into();
+        let login_bob = oauth.login_with_qr_code(Some(&registration_data)).scan(&qr_code);
+        let mut updates = login_bob.subscribe_to_progress();
+
+        let updates_task = spawn(async move {
+            let mut sender = Some(sender);
+
+            while let Some(update) = updates.next().await {
+                if let LoginProgress::EstablishingSecureChannel(QrProgress { check_code }) = update
+                {
+                    sender
+                        .take()
+                        .expect(
+                            "The establishing secure channel update should be received only once",
+                        )
+                        .send(check_code)
+                        .expect("Bob should be able to send the check code to Alice");
+                }
+            }
+        });
+        // Bob doesn't tell Alice about the failure, so she would wait forever
+        // for the `m.login.success` message.
+        let alice_task =
+            spawn(async { grant_login(alice, receiver, AliceBehaviour::HappyPath).await });
+
+        let error = login_bob.await.expect_err("Bob should fail to log in");
+        assert_matches!(error, QRCodeLoginError::UserIdDiscovery(_));
+
+        // The client is left as it was before the login.
+        assert!(bob.session_meta().is_none());
+        assert!(bob.session_tokens().is_none());
+
+        alice_task.abort();
+        updates_task.await.unwrap();
     }
 
     async fn grant_login_with_generated_qr(

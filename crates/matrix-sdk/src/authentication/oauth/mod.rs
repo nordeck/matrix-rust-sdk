@@ -973,6 +973,10 @@ impl OAuth {
     ///
     /// Returns an error if the authorization failed, if a request fails, or if
     /// the client was already logged in with a different session.
+    ///
+    /// If this fails, or if the future is dropped, after the session tokens
+    /// were obtained but before the session is set, the tokens are removed
+    /// again, so that the client is left as it was before the login.
     pub async fn finish_login(&self, url_or_query: UrlOrQuery) -> Result<()> {
         let response = AuthorizationResponse::parse_url_or_query(&url_or_query)
             .map_err(|error| OAuthError::from(OAuthAuthorizationCodeError::from(error)))?;
@@ -993,7 +997,13 @@ impl OAuth {
     ///
     /// Returns an error if the request to get the user ID fails, or if the
     /// client was already logged in with a different session.
+    ///
+    /// If this fails, or is cancelled, before the session is set, the session
+    /// tokens that were obtained during the login are removed from the client,
+    /// so that it is left as it was before the login.
     pub(crate) async fn load_session(&self, device_id: OwnedDeviceId) -> Result<()> {
+        let rollback = SessionTokensRollback::new(&self.client);
+
         // Get the user ID.
         let whoami_res = self.client.whoami().await.map_err(crate::Error::from)?;
 
@@ -1023,6 +1033,7 @@ impl OAuth {
             self.client.encryption().spawn_initialization_task(None).await;
         }
 
+        rollback.disarm();
         Ok(())
     }
 
@@ -1988,5 +1999,35 @@ impl ClientRegistrationData {
 impl From<Raw<ClientMetadata>> for ClientRegistrationData {
     fn from(value: Raw<ClientMetadata>) -> Self {
         Self::new(value)
+    }
+}
+
+/// Guard that removes the session tokens from the client if a login doesn't
+/// complete after the tokens were obtained.
+///
+/// The session metadata is the source of truth: if it was set, the login
+/// completed and the tokens are kept.
+pub(crate) struct SessionTokensRollback<'a> {
+    client: &'a Client,
+    armed: bool,
+}
+
+impl<'a> SessionTokensRollback<'a> {
+    pub(crate) fn new(client: &'a Client) -> Self {
+        Self { client, armed: true }
+    }
+
+    /// The login completed, keep the session tokens.
+    pub(crate) fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SessionTokensRollback<'_> {
+    fn drop(&mut self) {
+        if self.armed && self.client.session_meta().is_none() {
+            tracing::debug!("The login didn't complete, removing the session tokens.");
+            self.client.auth_ctx().clear_session_tokens();
+        }
     }
 }

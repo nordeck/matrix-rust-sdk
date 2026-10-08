@@ -112,7 +112,11 @@ impl DeviceCodeLoginProgress {
 /// verification URI and user code to present to the end-user.
 ///
 /// Dropping the future before it completes cancels the login: the client stops
-/// polling the authorization server and no session is set.
+/// polling the authorization server, and any session tokens that were already
+/// obtained are removed, so the client is left as it was before the login. The
+/// only exception is if the session was already set up on the client, i.e.
+/// [`Client::session_meta()`](crate::Client::session_meta) returns `Some`, in
+/// which case the login counts as complete.
 #[derive(Debug)]
 pub struct LoginWithDeviceCode {
     oauth: OAuth,
