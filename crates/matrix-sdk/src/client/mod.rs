@@ -560,6 +560,14 @@ impl Client {
         Self::builder().homeserver_url(homeserver_url).build().await
     }
 
+    /// Create a [`WeakClient`], i.e. a weak reference to the [`Client`], for
+    /// use in background tasks.
+    ///
+    /// See doc comment of [`WeakClient`].
+    pub fn downgrade(&self) -> WeakClient {
+        WeakClient::from_inner(&self.inner)
+    }
+
     /// Returns a subscriber that publishes an event every time the ignore user
     /// list changes.
     pub fn subscribe_to_ignore_user_list_changes(&self) -> Subscriber<Vec<String>> {
@@ -3532,6 +3540,19 @@ impl Client {
         self.inner.base_client.sync_token().await
     }
 
+    /// Wait until the next sync has been processed by the [`Client`].
+    ///
+    /// This will block until the [`Client`] has processed a sync response. This
+    /// works both for the sync v2 and the simplified sliding sync.
+    ///
+    /// Note this isn't concerned whether the sync was done by a specific
+    /// high-level sync service (like the encryption service or the sliding
+    /// sync service), but about low-level sync connections: for such
+    /// services, it will wait until *any* sync has completed.
+    pub async fn wait_for_sync(&self) {
+        self.inner.sync_beat.listen().await;
+    }
+
     /// Gets information about the owner of a given access token.
     pub async fn whoami(&self) -> HttpResult<whoami::v3::Response> {
         let request = whoami::v3::Request::new();
@@ -3632,7 +3653,7 @@ impl Client {
             .latest_events
             .get_or_init(|| async {
                 LatestEvents::new(
-                    WeakClient::from_client(self),
+                    self.downgrade(),
                     self.event_cache().clone(),
                     SendQueue::new(self.clone()),
                     self.room_info_notable_update_receiver(),
@@ -3972,10 +3993,15 @@ impl Client {
     }
 }
 
-/// A weak reference to the inner client, useful when trying to get a handle
+/// A weak reference to the inner [`Client`], useful when trying to get a handle
 /// on the owning client.
+///
+/// This is intended for use in background tasks that require a [`Client`], as
+/// otherwise killing all the [`Client`] instances wouldn't be sufficient to
+/// drop the underlying inner client, and resume in a memory leak at best, and
+/// confusing background syncs for a supposedly dead client at worst.
 #[derive(Clone, Debug)]
-pub(crate) struct WeakClient {
+pub struct WeakClient {
     client: Weak<ClientInner>,
 }
 
@@ -3985,11 +4011,6 @@ impl WeakClient {
         Self { client: Arc::downgrade(client) }
     }
 
-    /// Construct a [`WeakClient`] from a [`Client`].
-    pub fn from_client(client: &Client) -> Self {
-        Self::from_inner(&client.inner)
-    }
-
     /// Attempts to get a [`Client`] from this [`WeakClient`].
     pub fn get(&self) -> Option<Client> {
         self.client.upgrade().map(|inner| Client { inner })
@@ -3997,7 +4018,6 @@ impl WeakClient {
 
     /// Gets the number of strong (`Arc`) pointers still pointing to this
     /// client.
-    #[allow(dead_code)]
     pub fn strong_count(&self) -> usize {
         self.client.strong_count()
     }
@@ -4013,7 +4033,13 @@ struct PreJoinRoomInfo {
 // The http mocking library is not supported for wasm32
 #[cfg(all(test, not(target_family = "wasm")))]
 pub(crate) mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicU32, Ordering},
+        },
+        time::Duration,
+    };
 
     use assert_matches::assert_matches;
     use assert_matches2::assert_let;
@@ -4059,7 +4085,7 @@ pub(crate) mod tests {
     use super::Client;
     use crate::{
         Error, Result, TransmissionProgress,
-        client::{WeakClient, caches::CachedValue, futures::SendMediaUploadRequest},
+        client::{caches::CachedValue, futures::SendMediaUploadRequest},
         config::{RequestConfig, SyncSettings},
         futures::SendRequest,
         media::MediaError,
@@ -4520,7 +4546,7 @@ pub(crate) mod tests {
         // Wait for the init tasks to die.
         sleep(Duration::from_secs(1)).await;
 
-        let weak_client = WeakClient::from_client(&client);
+        let weak_client = client.downgrade();
         assert_eq!(weak_client.strong_count(), 1);
 
         {
@@ -5808,5 +5834,48 @@ pub(crate) mod tests {
         assert!(response.policies.is_empty());
         assert!(response.limits.max_lifetime.is_none());
         assert!(response.limits.min_lifetime.is_none());
+    }
+
+    #[async_test]
+    async fn test_wait_for_sync() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        let num_syncs = AtomicU32::new(0);
+
+        assert_eq!(num_syncs.load(Ordering::SeqCst), 0);
+
+        // Spawn a task that waits for 2 syncs in the background.
+        let client_clone = client.clone();
+        let task = spawn(async move {
+            client_clone.wait_for_sync().await;
+            client_clone.wait_for_sync().await;
+        });
+
+        // Sync once,
+        server
+            .mock_sync()
+            .ok_and_run(&client, |_| {
+                num_syncs.fetch_add(1, Ordering::SeqCst);
+            })
+            .await;
+
+        assert_eq!(num_syncs.load(Ordering::SeqCst), 1);
+
+        // Synce twice,
+        server
+            .mock_sync()
+            .ok_and_run(&client, |_| {
+                num_syncs.fetch_add(1, Ordering::SeqCst);
+            })
+            .await;
+
+        assert_eq!(num_syncs.load(Ordering::SeqCst), 2);
+
+        // The two waits should have completed by now!
+        timeout(Duration::from_secs(1), task)
+            .await
+            .expect("no timeout")
+            .expect("task didn't panick");
     }
 }

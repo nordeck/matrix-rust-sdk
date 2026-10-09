@@ -481,10 +481,10 @@ impl RoomSendQueue {
     ) -> Self {
         let (update_sender, _) = broadcast::channel(32);
 
-        let queue = QueueStorage::new(WeakClient::from_client(client), room_id.clone());
+        let queue = QueueStorage::new(client.downgrade(), room_id.clone());
         let notifier = Arc::new(Notify::new());
 
-        let weak_room = WeakRoom::new(WeakClient::from_client(client), room_id);
+        let weak_room = WeakRoom::new(client.downgrade(), room_id);
         let locally_enabled = Arc::new(AtomicBool::new(globally_enabled));
 
         let task = client.task_monitor().spawn_infinite_task(
@@ -3237,7 +3237,7 @@ mod tests {
     };
 
     use super::canonicalize_dependent_requests;
-    use crate::{client::WeakClient, test_utils::logged_in_client};
+    use crate::test_utils::logged_in_client;
 
     #[test]
     fn test_canonicalize_dependent_events_created_at() {
@@ -3275,7 +3275,7 @@ mod tests {
     async fn test_client_no_cycle_with_send_queue() {
         for enabled in [true, false] {
             let client = logged_in_client(None).await;
-            let weak_client = WeakClient::from_client(&client);
+            let weak_client = client.downgrade();
 
             {
                 let mut sync_response_builder = SyncResponseBuilder::new();
