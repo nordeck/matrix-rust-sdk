@@ -16,7 +16,11 @@
 //! matrix-sdk-search crate. It provides a [`SearchIndex`] which wraps
 //! multiple [`RoomIndex`].
 
-use std::{collections::hash_map::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::hash_map::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use futures_util::future::join_all;
 use matrix_sdk_base::{
@@ -49,15 +53,15 @@ use tracing::{debug, warn};
 
 use crate::event_cache::RoomEventCache;
 
-type Password = String;
+type Key = String;
 
 /// Type of location to store [`RoomIndex`]
 #[derive(Clone, Debug)]
 pub enum SearchIndexStoreKind {
     /// Store unencrypted in file system folder
     UnencryptedDirectory(PathBuf),
-    /// Store encrypted in file system folder
-    EncryptedDirectory(PathBuf, Password),
+    /// Store encrypted, with the given high-entropy key, in file system folder
+    EncryptedDirectory(PathBuf, Key),
     /// Store in memory
     InMemory,
 }
@@ -81,12 +85,55 @@ impl SearchIndex {
         Self { room_indexes, search_index_store_kind }
     }
 
+    /// The directory the room indexes are stored in, if they are stored on
+    /// disk.
+    pub(crate) fn directory(&self) -> Option<&Path> {
+        match &self.search_index_store_kind {
+            SearchIndexStoreKind::UnencryptedDirectory(path)
+            | SearchIndexStoreKind::EncryptedDirectory(path, _) => Some(path),
+            SearchIndexStoreKind::InMemory => None,
+        }
+    }
+
+    /// The disk size of the room indexes, if they are stored on disk.
+    pub(crate) fn size(&self) -> Option<usize> {
+        fn dir_size(path: &Path) -> std::io::Result<u64> {
+            let mut size = 0;
+            for entry in std::fs::read_dir(path)? {
+                let entry = entry?;
+                let metadata = entry.metadata()?;
+                size += if metadata.is_dir() { dir_size(&entry.path())? } else { metadata.len() };
+            }
+            Ok(size)
+        }
+
+        let size = dir_size(self.directory()?).ok()?;
+        usize::try_from(size).ok()
+    }
+
     /// Acquire [`SearchIndexGuard`] for this [`SearchIndex`].
     pub async fn lock(&self) -> SearchIndexGuard<'_> {
         SearchIndexGuard {
             index_map: self.room_indexes.lock().await,
             search_index_store_kind: &self.search_index_store_kind,
         }
+    }
+
+    /// Same as [`SearchIndexGuard::bulk_handle_timeline_event`], but only
+    /// locks the index once the events are parsed: parsing waits on the event
+    /// cache, and searches need the lock meanwhile.
+    pub(crate) async fn bulk_handle_timeline_event<T>(
+        &self,
+        events: T,
+        room_cache: &RoomEventCache,
+        room_id: &RoomId,
+        redaction_rules: &RedactionRules,
+    ) -> Result<(), IndexError>
+    where
+        T: Iterator<Item = TimelineEvent>,
+    {
+        let operations = parse_timeline_events(events, room_cache, redaction_rules).await;
+        self.lock().await.bulk_execute(operations, room_id)
     }
 }
 
@@ -106,10 +153,8 @@ impl SearchIndexGuard<'_> {
             SearchIndexStoreKind::UnencryptedDirectory(path) => {
                 RoomIndexBuilder::new_on_disk(path.to_path_buf(), room_id).unencrypted().build()?
             }
-            SearchIndexStoreKind::EncryptedDirectory(path, password) => {
-                RoomIndexBuilder::new_on_disk(path.to_path_buf(), room_id)
-                    .encrypted(password)
-                    .build()?
+            SearchIndexStoreKind::EncryptedDirectory(path, key) => {
+                RoomIndexBuilder::new_on_disk(path.to_path_buf(), room_id).encrypted(key).build()?
             }
             SearchIndexStoreKind::InMemory => RoomIndexBuilder::new_in_memory(room_id).build(),
         };
@@ -138,6 +183,18 @@ impl SearchIndexGuard<'_> {
         index.execute(operation)
     }
 
+    /// Whether a [`RoomIndex`] exists for this room, in memory or on disk.
+    fn has_index(&self, room_id: &RoomId) -> bool {
+        self.index_map.contains_key(room_id)
+            || match self.search_index_store_kind {
+                SearchIndexStoreKind::UnencryptedDirectory(path)
+                | SearchIndexStoreKind::EncryptedDirectory(path, _) => {
+                    path.join(room_id.as_str()).exists()
+                }
+                SearchIndexStoreKind::InMemory => false,
+            }
+    }
+
     /// Handle a [`RoomIndexOperation`] in the [`RoomIndex`] of a given
     /// [`RoomId`]
     ///
@@ -148,6 +205,11 @@ impl SearchIndexGuard<'_> {
         operations: Vec<RoomIndexOperation>,
         room_id: &RoomId,
     ) -> Result<(), IndexError> {
+        // Don't create an index (which is costly) for nothing.
+        if operations.is_empty() {
+            return Ok(());
+        }
+
         if !self.index_map.contains_key(room_id) {
             let index = self.create_index(room_id)?;
             self.index_map.insert(room_id.to_owned(), index);
@@ -167,6 +229,12 @@ impl SearchIndexGuard<'_> {
         pagination_offset: Option<usize>,
         room_id: &RoomId,
     ) -> Result<SearchResult, IndexError> {
+        // Nothing was ever indexed for this room: don't create an index (which
+        // is costly) only to find it empty.
+        if !self.has_index(room_id) {
+            return Ok(SearchResult { total_count: 0, events: Vec::new() });
+        }
+
         if !self.index_map.contains_key(room_id) {
             let index = self.create_index(room_id)?;
             self.index_map.insert(room_id.to_owned(), index);
@@ -211,12 +279,19 @@ impl SearchIndexGuard<'_> {
     where
         T: Iterator<Item = TimelineEvent>,
     {
-        let futures = events.map(|ev| parse_timeline_event(room_cache, ev, redaction_rules));
-
-        let operations: Vec<_> = join_all(futures).await.into_iter().flatten().collect();
-
+        let operations = parse_timeline_events(events, room_cache, redaction_rules).await;
         self.bulk_execute(operations, room_id)
     }
+}
+
+/// Derive the [`RoomIndexOperation`]s to execute for the given events.
+async fn parse_timeline_events(
+    events: impl Iterator<Item = TimelineEvent>,
+    room_cache: &RoomEventCache,
+    redaction_rules: &RedactionRules,
+) -> Vec<RoomIndexOperation> {
+    let futures = events.map(|ev| parse_timeline_event(room_cache, ev, redaction_rules));
+    join_all(futures).await.into_iter().flatten().collect()
 }
 
 /// Given an event id this function returns the most recent edit on said event
@@ -508,6 +583,73 @@ mod tests {
     };
 
     use crate::test_utils::mocks::MatrixMockServer;
+
+    #[cfg(feature = "experimental-search")]
+    #[async_test]
+    async fn test_search_index_size() {
+        use super::SearchIndexStoreKind;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mock_server = MatrixMockServer::new().await;
+        let client = mock_server
+            .client_builder()
+            .on_builder(|builder| {
+                builder.search_index_store(SearchIndexStoreKind::UnencryptedDirectory(
+                    dir.path().join("search"),
+                ))
+            })
+            .build()
+            .await;
+
+        // Nothing indexed yet: the directory doesn't even exist.
+        assert_eq!(client.get_store_sizes().await.unwrap().search_index, None);
+
+        let room_id = room_id!("!room_id:localhost");
+        mock_server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id).add_timeline_event(
+                    EventFactory::new()
+                        .text_msg("this is a sentence")
+                        .room(room_id)
+                        .sender(user_id!("@user_id:localhost")),
+                ),
+            )
+            .await;
+
+        // Let the indexer process the event.
+        for _ in 0..50 {
+            if client.get_store_sizes().await.unwrap().search_index.is_some_and(|size| size > 0) {
+                return;
+            }
+            crate::sleep::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!("the search index size was never reported");
+    }
+
+    #[cfg(feature = "experimental-search")]
+    #[async_test]
+    async fn test_no_index_is_created_for_nothing() {
+        use super::{SearchIndex, SearchIndexStoreKind};
+
+        let dir = tempfile::tempdir().unwrap();
+        let search_index = SearchIndex::new(
+            Default::default(),
+            SearchIndexStoreKind::UnencryptedDirectory(dir.path().to_path_buf()),
+        );
+        let room_id = room_id!("!room_id:localhost");
+        let mut guard = search_index.lock().await;
+
+        // Searching a room that was never indexed finds nothing…
+        let result = guard.search("sentence", 10, None, room_id).unwrap();
+        assert_eq!(result.total_count, 0);
+        assert!(result.events.is_empty());
+
+        // … and so does an empty batch of operations: none creates an index.
+        guard.bulk_execute(Vec::new(), room_id).unwrap();
+
+        assert!(!dir.path().join(room_id.as_str()).exists());
+    }
 
     #[cfg(feature = "experimental-search")]
     #[async_test]

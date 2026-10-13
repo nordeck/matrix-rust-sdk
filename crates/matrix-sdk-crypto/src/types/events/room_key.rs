@@ -83,16 +83,28 @@ impl RoomKeyContent {
             pub room_id: &'a RoomId,
             pub session_id: &'a str,
             pub session_key: &'a str,
+            pub shared_history: bool,
             #[serde(flatten)]
             other: &'a BTreeMap<String, Value>,
         }
 
         let serialize_helper = |content: &MegolmV1AesSha2Content| {
+            // Destructure the content so that the compiler reminds us to handle
+            // any newly added fields here.
+            let MegolmV1AesSha2Content {
+                room_id,
+                session_id,
+                session_key: _,
+                shared_history,
+                other,
+            } = content;
+
             let helper = Helper {
-                room_id: &content.room_id,
-                session_id: &content.session_id,
+                room_id,
+                session_id,
                 session_key: "",
-                other: &content.other,
+                shared_history: *shared_history,
+                other,
             };
 
             let helper =
@@ -318,5 +330,40 @@ pub(crate) mod tests {
     #[test]
     fn deserialization_legacy() {
         check_shared_history(SharedHistoryField::Legacy);
+    }
+
+    /// Zeroize the content of the given event, and return it as JSON.
+    fn serialize_zeroized(json: Value) -> Value {
+        let event: RoomKeyEvent = serde_json::from_value(json)
+            .expect("We should be able to deserialize the m.room_key event");
+        event
+            .content
+            .serialize_zeroized()
+            .expect("We should be able to serialize the zeroized m.room_key content")
+            .deserialize_as()
+            .expect("The zeroized m.room_key content should be valid JSON")
+    }
+
+    #[test]
+    fn serialization_zeroized() {
+        assert_eq!(
+            serialize_zeroized(json_stable()),
+            json!({
+                "m.custom": "something custom",
+                "algorithm": "m.megolm.v1.aes-sha2",
+                "room_id": "!Cuyf34gef24t:localhost",
+                "shared_history": true,
+                "session_id": "ZFD6+OmV7fVCsJ7Gap8UnORH8EnmiAkes8FAvQuCw/I",
+                "session_key": "",
+            })
+        );
+    }
+
+    #[test]
+    fn serialization_zeroized_not_shared_history() {
+        let mut json = json_stable();
+        json["content"]["shared_history"] = false.into();
+
+        assert_eq!(serialize_zeroized(json)["shared_history"], false);
     }
 }
