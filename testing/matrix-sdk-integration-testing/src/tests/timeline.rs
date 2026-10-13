@@ -34,7 +34,7 @@ use matrix_sdk::{
         MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, RoomId, UserId,
         api::client::room::create_room::v3::{Request as CreateRoomRequest, RoomPreset},
         events::{
-            InitialStateEvent,
+            InitialStateEvent, TimelineEventType,
             room::{
                 encryption::RoomEncryptionEventContent,
                 message::{
@@ -144,9 +144,16 @@ async fn test_toggling_reaction() -> Result<()> {
         unreachable!();
     });
 
-    // Create a timeline for this room.
-    debug!("Creating timeline…");
-    let timeline = Arc::new(room.timeline().await.unwrap());
+    // Create a timeline for this room, with a timeline filter for messages to
+    // ignore other events that might interfere with the checks.
+    debug!("Creating timeline for messages…");
+    let timeline = Arc::new(
+        room.timeline_builder()
+            .event_filter(|event, _| event.event_type() == TimelineEventType::RoomMessage)
+            .build()
+            .await
+            .unwrap(),
+    );
 
     // Send message.
     debug!("Sending initial message…");

@@ -4112,11 +4112,17 @@ impl Client {
 
         let media_store_size = self.media_store().lock().await?.get_size().await.ok().flatten();
 
+        #[cfg(feature = "experimental-search")]
+        let search_index_size = self.search_index().size();
+        #[cfg(not(feature = "experimental-search"))]
+        let search_index_size = None;
+
         Ok(StoreSizes {
             crypto_store: crypto_store_size,
             state_store: state_store_size,
             event_cache_store: event_cache_store_size,
             media_store: media_store_size,
+            search_index: search_index_size,
         })
     }
 
@@ -4178,6 +4184,8 @@ pub struct StoreSizes {
     pub event_cache_store: Option<usize>,
     /// The size of the MediaStore.
     pub media_store: Option<usize>,
+    /// The size of the search index.
+    pub search_index: Option<usize>,
 }
 
 /// A custom to-device message received by the client.
@@ -5867,9 +5875,7 @@ pub(crate) mod tests {
         let f = EventFactory::new().sender(user_id!("@example:localhost"));
         let response = SyncResponseBuilder::default()
             .add_joined_room(JoinedRoomBuilder::default().add_state_event(f.member(user_id)))
-            .add_global_account_data(
-                f.direct().add_user(user_id.to_owned().into(), *DEFAULT_TEST_ROOM_ID),
-            )
+            .add_global_account_data(f.direct().add_user(user_id, *DEFAULT_TEST_ROOM_ID))
             .build_sync_response();
         client.base_client().receive_sync_response(response).await.unwrap();
 
@@ -5892,9 +5898,7 @@ pub(crate) mod tests {
                 JoinedRoomBuilder::default()
                     .add_state_event(f.member(user_id).invited(user_id).display_name("example")),
             )
-            .add_global_account_data(
-                f.direct().add_user(user_id.to_owned().into(), *DEFAULT_TEST_ROOM_ID),
-            )
+            .add_global_account_data(f.direct().add_user(user_id, *DEFAULT_TEST_ROOM_ID))
             .build_sync_response();
         client.base_client().receive_sync_response(response).await.unwrap();
 
@@ -5923,9 +5927,7 @@ pub(crate) mod tests {
             .add_joined_room(
                 JoinedRoomBuilder::default().add_state_event(f.member(user_id).leave()),
             )
-            .add_global_account_data(
-                f.direct().add_user(user_id.to_owned().into(), *DEFAULT_TEST_ROOM_ID),
-            )
+            .add_global_account_data(f.direct().add_user(user_id, *DEFAULT_TEST_ROOM_ID))
             .build_sync_response();
         client.base_client().receive_sync_response(response).await.unwrap();
 

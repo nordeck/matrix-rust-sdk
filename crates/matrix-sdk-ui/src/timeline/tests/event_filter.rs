@@ -17,7 +17,7 @@ use std::sync::Arc;
 use assert_matches::assert_matches;
 use eyeball_im::VectorDiff;
 use matrix_sdk::deserialized_responses::TimelineEvent;
-use matrix_sdk_test::{ALICE, BOB, User, async_test, sync_timeline_event};
+use matrix_sdk_test::{User, async_test, sync_timeline_event};
 use ruma::{
     events::{
         AnySyncTimelineEvent, MessageLikeEventType, StateEventType, TimelineEventType,
@@ -104,9 +104,11 @@ async fn test_filter_always_false() {
     let f = &timeline.factory;
     timeline.handle_live_event(f.text_msg("The first message").sender(User::Alice)).await;
 
-    timeline.handle_live_event(f.redacted(&ALICE, RedactedRoomMessageEventContent::new())).await;
+    timeline
+        .handle_live_event(f.redacted(User::Alice, RedactedRoomMessageEventContent::new()))
+        .await;
 
-    timeline.handle_live_event(f.member(&ALICE).membership(MembershipState::Join)).await;
+    timeline.handle_live_event(f.member(User::Alice).membership(MembershipState::Join)).await;
 
     timeline.handle_live_event(f.room_name("Alice's room").sender(User::Alice)).await;
 
@@ -130,10 +132,12 @@ async fn test_custom_filter() {
     let _item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     let _date_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
 
-    timeline.handle_live_event(f.redacted(&ALICE, RedactedRoomMessageEventContent::new())).await;
+    timeline
+        .handle_live_event(f.redacted(User::Alice, RedactedRoomMessageEventContent::new()))
+        .await;
     let _item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
 
-    timeline.handle_live_event(f.member(&ALICE).membership(MembershipState::Join)).await;
+    timeline.handle_live_event(f.member(User::Alice).membership(MembershipState::Join)).await;
 
     timeline.handle_live_event(f.room_name("Alice's room").sender(User::Alice)).await;
 
@@ -289,11 +293,11 @@ async fn test_event_filter_include_only_membership_changes() {
     let f = &timeline.factory;
 
     // Add Alice's join event
-    timeline.handle_live_event(f.member(&ALICE).membership(MembershipState::Join)).await;
+    timeline.handle_live_event(f.member(User::Alice).membership(MembershipState::Join)).await;
     // Alice changes her avatar
     timeline
         .handle_live_event(
-            f.member(&ALICE)
+            f.member(User::Alice)
                 .avatar_url(mxc_uri!("mxc://example.org/SEsfnsuifSDFSSEF"))
                 .previous(MembershipState::Join),
         )
@@ -303,12 +307,12 @@ async fn test_event_filter_include_only_membership_changes() {
     timeline.handle_live_event(f.room_name("A new room name").sender(User::Alice)).await;
     timeline.handle_live_event(f.room_topic("A new room topic").sender(User::Alice)).await;
     // Alice invites Bob and Bob joins
-    timeline.handle_live_event(f.member(&ALICE).invited(&BOB)).await;
-    timeline.handle_live_event(f.member(&BOB).previous(MembershipState::Invite)).await;
+    timeline.handle_live_event(f.member(User::Alice).invited(User::Bob)).await;
+    timeline.handle_live_event(f.member(User::Bob).previous(MembershipState::Invite)).await;
     // Bob changes his display name
     timeline
         .handle_live_event(
-            f.member(&BOB).display_name("Big Bob 99").previous(MembershipState::Join),
+            f.member(User::Bob).display_name("Big Bob 99").previous(MembershipState::Join),
         )
         .await;
 
@@ -342,11 +346,11 @@ async fn test_event_filter_include_only_profile_changes() {
     let f = &timeline.factory;
 
     // Add Alice's join event
-    timeline.handle_live_event(f.member(&ALICE).membership(MembershipState::Join)).await;
+    timeline.handle_live_event(f.member(User::Alice).membership(MembershipState::Join)).await;
     // Alice changes her avatar
     timeline
         .handle_live_event(
-            f.member(&ALICE)
+            f.member(User::Alice)
                 .avatar_url(mxc_uri!("mxc://example.org/SEsfnsuifSDFSSEF"))
                 .previous(MembershipState::Join),
         )
@@ -356,12 +360,12 @@ async fn test_event_filter_include_only_profile_changes() {
     timeline.handle_live_event(f.room_name("A new room name").sender(User::Alice)).await;
     timeline.handle_live_event(f.room_topic("A new room topic").sender(User::Alice)).await;
     // Alice invites Bob and Bob joins
-    timeline.handle_live_event(f.member(&ALICE).invited(&BOB)).await;
-    timeline.handle_live_event(f.member(&BOB).previous(MembershipState::Invite)).await;
+    timeline.handle_live_event(f.member(User::Alice).invited(User::Bob)).await;
+    timeline.handle_live_event(f.member(User::Bob).previous(MembershipState::Invite)).await;
     // Bob changes his display name
     timeline
         .handle_live_event(
-            f.member(&BOB).display_name("Big Bob 99").previous(MembershipState::Join),
+            f.member(User::Bob).display_name("Big Bob 99").previous(MembershipState::Join),
         )
         .await;
 
@@ -398,11 +402,11 @@ async fn test_event_filter_include_only_messages_and_membership_changes() {
     let f = &timeline.factory;
 
     // Add Alice's join event
-    timeline.handle_live_event(f.member(&ALICE).membership(MembershipState::Join)).await;
+    timeline.handle_live_event(f.member(User::Alice).membership(MembershipState::Join)).await;
     // Alice changes her avatar
     timeline
         .handle_live_event(
-            f.member(&ALICE)
+            f.member(User::Alice)
                 .avatar_url(mxc_uri!("mxc://example.org/SEsfnsuifSDFSSEF"))
                 .previous(MembershipState::Join),
         )
@@ -412,12 +416,12 @@ async fn test_event_filter_include_only_messages_and_membership_changes() {
     timeline.handle_live_event(f.room_name("A new room name").sender(User::Alice)).await;
     timeline.handle_live_event(f.room_topic("A new room topic").sender(User::Alice)).await;
     // Alice invites Bob and Bob joins
-    timeline.handle_live_event(f.member(&ALICE).invited(&BOB)).await;
-    timeline.handle_live_event(f.member(&BOB).previous(MembershipState::Invite)).await;
+    timeline.handle_live_event(f.member(User::Alice).invited(User::Bob)).await;
+    timeline.handle_live_event(f.member(User::Bob).previous(MembershipState::Invite)).await;
     // Bob changes his display name
     timeline
         .handle_live_event(
-            f.member(&BOB).display_name("Big Bob 99").previous(MembershipState::Join),
+            f.member(User::Bob).display_name("Big Bob 99").previous(MembershipState::Join),
         )
         .await;
 
@@ -454,11 +458,11 @@ async fn test_event_filter_exclude_membership_changes() {
     let f = &timeline.factory;
 
     // Add Alice's join event
-    timeline.handle_live_event(f.member(&ALICE).membership(MembershipState::Join)).await;
+    timeline.handle_live_event(f.member(User::Alice).membership(MembershipState::Join)).await;
     // Alice changes her avatar
     timeline
         .handle_live_event(
-            f.member(&ALICE)
+            f.member(User::Alice)
                 .avatar_url(mxc_uri!("mxc://example.org/SEsfnsuifSDFSSEF"))
                 .previous(MembershipState::Join),
         )
@@ -468,12 +472,12 @@ async fn test_event_filter_exclude_membership_changes() {
     timeline.handle_live_event(f.room_name("A new room name").sender(User::Alice)).await;
     timeline.handle_live_event(f.room_topic("A new room topic").sender(User::Alice)).await;
     // Alice invites Bob and Bob joins
-    timeline.handle_live_event(f.member(&ALICE).invited(&BOB)).await;
-    timeline.handle_live_event(f.member(&BOB).previous(MembershipState::Invite)).await;
+    timeline.handle_live_event(f.member(User::Alice).invited(User::Bob)).await;
+    timeline.handle_live_event(f.member(User::Bob).previous(MembershipState::Invite)).await;
     // Bob changes his display name
     timeline
         .handle_live_event(
-            f.member(&BOB).display_name("Big Bob 99").previous(MembershipState::Join),
+            f.member(User::Bob).display_name("Big Bob 99").previous(MembershipState::Join),
         )
         .await;
 
@@ -508,11 +512,11 @@ async fn test_event_filter_exclude_profile_changes() {
     let f = &timeline.factory;
 
     // Add Alice's join event
-    timeline.handle_live_event(f.member(&ALICE).membership(MembershipState::Join)).await;
+    timeline.handle_live_event(f.member(User::Alice).membership(MembershipState::Join)).await;
     // Alice changes her avatar
     timeline
         .handle_live_event(
-            f.member(&ALICE)
+            f.member(User::Alice)
                 .avatar_url(mxc_uri!("mxc://example.org/SEsfnsuifSDFSSEF"))
                 .previous(MembershipState::Join),
         )
@@ -522,12 +526,12 @@ async fn test_event_filter_exclude_profile_changes() {
     timeline.handle_live_event(f.room_name("A new room name").sender(User::Alice)).await;
     timeline.handle_live_event(f.room_topic("A new room topic").sender(User::Alice)).await;
     // Alice invites Bob and Bob joins
-    timeline.handle_live_event(f.member(&ALICE).invited(&BOB)).await;
-    timeline.handle_live_event(f.member(&BOB).previous(MembershipState::Invite)).await;
+    timeline.handle_live_event(f.member(User::Alice).invited(User::Bob)).await;
+    timeline.handle_live_event(f.member(User::Bob).previous(MembershipState::Invite)).await;
     // Bob changes his display name
     timeline
         .handle_live_event(
-            f.member(&BOB).display_name("Big Bob 99").previous(MembershipState::Join),
+            f.member(User::Bob).display_name("Big Bob 99").previous(MembershipState::Join),
         )
         .await;
 
@@ -565,11 +569,11 @@ async fn test_event_filter_exclude_messages_and_membership_changes() {
     let f = &timeline.factory;
 
     // Add Alice's join event
-    timeline.handle_live_event(f.member(&ALICE).membership(MembershipState::Join)).await;
+    timeline.handle_live_event(f.member(User::Alice).membership(MembershipState::Join)).await;
     // Alice changes her avatar
     timeline
         .handle_live_event(
-            f.member(&ALICE)
+            f.member(User::Alice)
                 .avatar_url(mxc_uri!("mxc://example.org/SEsfnsuifSDFSSEF"))
                 .previous(MembershipState::Join),
         )
@@ -579,12 +583,12 @@ async fn test_event_filter_exclude_messages_and_membership_changes() {
     timeline.handle_live_event(f.room_name("A new room name").sender(User::Alice)).await;
     timeline.handle_live_event(f.room_topic("A new room topic").sender(User::Alice)).await;
     // Alice invites Bob and Bob joins
-    timeline.handle_live_event(f.member(&ALICE).invited(&BOB)).await;
-    timeline.handle_live_event(f.member(&BOB).previous(MembershipState::Invite)).await;
+    timeline.handle_live_event(f.member(User::Alice).invited(User::Bob)).await;
+    timeline.handle_live_event(f.member(User::Bob).previous(MembershipState::Invite)).await;
     // Bob changes his display name
     timeline
         .handle_live_event(
-            f.member(&BOB).display_name("Big Bob 99").previous(MembershipState::Join),
+            f.member(User::Bob).display_name("Big Bob 99").previous(MembershipState::Join),
         )
         .await;
 
@@ -621,11 +625,11 @@ async fn test_event_filter_can_exclude_only_join_and_leave_membership_changes() 
     let f = &timeline.factory;
 
     // Add Alice's join event
-    timeline.handle_live_event(f.member(&ALICE).membership(MembershipState::Join)).await;
+    timeline.handle_live_event(f.member(User::Alice).membership(MembershipState::Join)).await;
     // Alice changes her avatar
     timeline
         .handle_live_event(
-            f.member(&ALICE)
+            f.member(User::Alice)
                 .avatar_url(mxc_uri!("mxc://example.org/SEsfnsuifSDFSSEF"))
                 .previous(MembershipState::Join),
         )
@@ -635,13 +639,13 @@ async fn test_event_filter_can_exclude_only_join_and_leave_membership_changes() 
     timeline.handle_live_event(f.room_name("A new room name").sender(User::Alice)).await;
     timeline.handle_live_event(f.room_topic("A new room topic").sender(User::Alice)).await;
     // Alice invites Bob and Bob changes his display name and leaves
-    timeline.handle_live_event(f.member(&ALICE).invited(&BOB)).await;
+    timeline.handle_live_event(f.member(User::Alice).invited(User::Bob)).await;
     timeline
         .handle_live_event(
-            f.member(&BOB).display_name("Big Bob 99").previous(MembershipState::Join),
+            f.member(User::Bob).display_name("Big Bob 99").previous(MembershipState::Join),
         )
         .await;
-    timeline.handle_live_event(f.member(&BOB).leave().previous(MembershipState::Invite)).await;
+    timeline.handle_live_event(f.member(User::Bob).leave().previous(MembershipState::Invite)).await;
 
     // The timeline should contain everything except for the message, invite and
     // join events
