@@ -18,6 +18,8 @@ use matrix_sdk_test::{
     DEFAULT_TEST_ROOM_ID, InvitedRoomBuilder, JoinedRoomBuilder, User, async_test,
     event_factory::EventFactory,
 };
+#[cfg(feature = "unstable-msc4536")]
+use ruma::profile::ProfileFieldValue;
 use ruma::{
     OwnedUserId, RoomVersionId, TransactionId,
     api::{
@@ -656,7 +658,7 @@ async fn test_fetch_members_deduplication() {
     let server = MatrixMockServer::new().await;
     let client = server.client_builder().build().await;
 
-    let room = server.sync_joined_room(&client, &DEFAULT_TEST_ROOM_ID).await;
+    let room = server.sync_default_joined_room(&client).await;
 
     // We don't need any members, we're just checking if we're correctly
     // deduplicating calls to the method.
@@ -709,7 +711,7 @@ async fn test_report_content() {
     let client = server.client_builder().build().await;
 
     server.mock_report_room_event().ok().expect(1).mount().await;
-    let room = server.sync_joined_room(&client, &DEFAULT_TEST_ROOM_ID).await;
+    let room = server.sync_default_joined_room(&client).await;
 
     let event_id = owned_event_id!("$offensive_event");
     room.report_content(event_id, Some("I am offended".to_owned())).await.unwrap();
@@ -764,7 +766,9 @@ async fn test_subscribe_to_typing_notifications() {
         .await;
 
     // Then send a typing notification with no user typing
-    server.sync_room(&client, JoinedRoomBuilder::new(room_id).add_typing(f.typing(vec![]))).await;
+    server
+        .sync_room(&client, JoinedRoomBuilder::new(room_id).add_typing(f.typing::<User>([])))
+        .await;
 
     join_handle.await.unwrap();
     assert_eq!(typing_sequences.lock().unwrap().to_vec(), asserted_typing_sequences);
@@ -1459,4 +1463,89 @@ async fn test_send_sticky_event() {
 
     let result = room.send(RoomMessageEventContent::text_plain("hello")).await.unwrap();
     assert_eq!(result.response.event_id, event_id!("$regular"));
+}
+
+#[cfg(feature = "unstable-msc4536")]
+#[async_test]
+async fn test_fetch_missing_global_profiles_in_background() {
+    let server = MatrixMockServer::new().await;
+    server
+        .mock_versions()
+        .with_versions(vec!["v1.16"])
+        .with_profiles_sliding_sync_extension()
+        .with_query_profiles()
+        .ok()
+        .named("versions")
+        .mount()
+        .await;
+    let client = server.client_builder().no_server_versions().build().await;
+    let mut profile_updates = client.subscribe_to_global_profile_updates();
+
+    let room_id = room_id!("!room:example.org");
+    let alice = owned_user_id!("@alice:example.org");
+    let bob = owned_user_id!("@bob:example.org");
+    let factory = EventFactory::new().room(room_id);
+
+    // Given a room whose members are loaded through `/members`, where Alice is
+    // joined and Bob has left.
+    let room = server.sync_joined_room(&client, room_id).await;
+    server
+        .mock_get_members()
+        .ok(vec![
+            factory.member(&alice).membership(MembershipState::Join).into_raw(),
+            factory.member(&bob).membership(MembershipState::Leave).into_raw(),
+        ])
+        .mock_once()
+        .mount()
+        .await;
+    room.sync_members().await.unwrap();
+
+    server
+        .mock_query_profiles()
+        .expect_users(std::slice::from_ref(&alice))
+        .ok_with_profiles(vec![(
+            alice.clone(),
+            vec![ProfileFieldValue::DisplayName("Alice".to_owned())],
+        )])
+        .mock_once()
+        .mount()
+        .await;
+
+    // When fetching the members' missing global profiles in the background.
+    room.fetch_missing_global_profiles_in_background().await.unwrap();
+
+    // Then only Alice is queried, as Bob has left (verified by the mock on
+    // drop).
+    let updated = assert_recv_with_timeout!(profile_updates, 1000);
+    assert_eq!(updated, BTreeSet::from([alice.clone()]));
+
+    // And Alice's global profile is stored, with subscribers notified.
+    let profile = client.state_store().get_global_profile(&alice).await.unwrap().unwrap();
+    assert_eq!(profile.get("displayname"), Some(&json!("Alice")));
+}
+
+#[cfg(feature = "unstable-msc4536")]
+#[async_test]
+async fn test_fetch_missing_global_profiles_in_background_requires_server_support() {
+    let server = MatrixMockServer::new().await;
+
+    // Given a homeserver that syncs global profiles, but doesn't support
+    // fetching multiple profiles.
+    server
+        .mock_versions()
+        .with_versions(vec!["v1.16"])
+        .with_profiles_sliding_sync_extension()
+        .ok()
+        .named("versions")
+        .mount()
+        .await;
+    let client = server.client_builder().no_server_versions().build().await;
+    let room = server.sync_joined_room(&client, room_id!("!room:example.org")).await;
+
+    // Then no profiles are fetched.
+    server.mock_query_profiles().ok_with_profiles(vec![]).never().mount().await;
+
+    // When fetching the members' missing global profiles in the background.
+    room.fetch_missing_global_profiles_in_background().await.unwrap();
+    sleep(Duration::from_millis(100)).await;
 }

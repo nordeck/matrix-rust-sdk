@@ -60,6 +60,8 @@ use matrix_sdk_common::{
 };
 use mime::Mime;
 use reply::Reply;
+#[cfg(feature = "unstable-msc4536")]
+use ruma::api::FeatureFlag;
 #[cfg(feature = "e2e-encryption")]
 use ruma::events::AnySyncMessageLikeEvent;
 #[cfg(feature = "experimental-encrypted-state-events")]
@@ -1314,6 +1316,41 @@ impl Room {
             .into_iter()
             .map(|member| RoomMember::new(self.client.clone(), member))
             .collect())
+    }
+
+    /// Fetch the missing global profiles of this room's joined members in the
+    /// background, e.g. after loading the members with [`Room::members()`].
+    ///
+    /// This returns once the fetch is queued, without waiting for the profiles.
+    /// They are announced through
+    /// [`Client::subscribe_to_global_profile_updates()`] as they are
+    /// stored.
+    ///
+    /// This does nothing unless the room is joined, global profiles are being
+    /// synced (see [`Client::is_global_profile_sync_enabled()`]) and the
+    /// homeserver supports [MSC4536]. The first two are needed for the sync to
+    /// keep the fetched profiles up to date.
+    ///
+    /// [MSC4536]: https://github.com/matrix-org/matrix-spec-proposals/pull/4536
+    #[cfg(feature = "unstable-msc4536")]
+    pub async fn fetch_missing_global_profiles_in_background(&self) -> Result<()> {
+        if self.state() != RoomState::Joined {
+            return Ok(());
+        }
+
+        if !self.client.is_global_profile_sync_enabled().await? {
+            return Ok(());
+        }
+
+        if !self.client.unstable_features().await?.contains(&FeatureFlag::Msc4536) {
+            debug!("The homeserver doesn't support fetching multiple profiles");
+            return Ok(());
+        }
+
+        let user_ids = self.inner.joined_user_ids().await?;
+        self.client.global_profile_fetcher().enqueue(user_ids);
+
+        Ok(())
     }
 
     /// Get the user IDs of the members with the given memberships, without the
@@ -4341,10 +4378,10 @@ impl Room {
     /// for more info.
     pub fn effective_retention_with_server_config(
         &self,
-        config: &get_retention_configuration::unstable::Response,
+        config: &get_retention_configuration::msc1763::Response,
     ) -> Option<RoomRetentionEventContent> {
         use ruma::api::client::retention::{
-            RoomIdOrAllRooms, get_retention_configuration::unstable::LifetimeLimits,
+            RoomIdOrAllRooms, get_retention_configuration::msc1763::LifetimeLimits,
         };
 
         fn clamp(value: Option<Duration>, limits: &Option<LifetimeLimits>) -> Option<Duration> {
@@ -4485,7 +4522,7 @@ impl Room {
 
         match self
             .client
-            .send(subscribe_thread::unstable::Request::new(
+            .send(subscribe_thread::msc4306::Request::new(
                 self.room_id().to_owned(),
                 thread_root.clone(),
                 automatic,
@@ -4567,7 +4604,7 @@ impl Room {
     #[instrument(skip(self), fields(room_id = %self.room_id()))]
     pub async fn unsubscribe_thread(&self, thread_root: OwnedEventId) -> Result<()> {
         self.client
-            .send(unsubscribe_thread::unstable::Request::new(
+            .send(unsubscribe_thread::msc4306::Request::new(
                 self.room_id().to_owned(),
                 thread_root.clone(),
             ))
@@ -4614,7 +4651,7 @@ impl Room {
     ) -> Result<Option<ThreadSubscription>> {
         let result = self
             .client
-            .send(get_thread_subscription::unstable::Request::new(
+            .send(get_thread_subscription::msc4306::Request::new(
                 self.room_id().to_owned(),
                 thread_root.clone(),
             ))

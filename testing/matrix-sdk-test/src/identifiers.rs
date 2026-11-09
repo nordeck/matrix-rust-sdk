@@ -4,9 +4,10 @@ use std::{fmt, hash::Hash, sync::LazyLock};
 
 use indexmap::Equivalent;
 use ruma::{
-    OwnedRoomId, OwnedRoomOrAliasId, OwnedUserId, RoomId, RoomOrAliasId, UserId,
+    DeviceId, OwnedDeviceId, OwnedRoomId, OwnedRoomOrAliasId, OwnedUserId, RoomId, RoomOrAliasId,
+    UserId,
     events::direct::{DirectUserIdentifier, OwnedDirectUserIdentifier},
-    owned_room_id, owned_user_id,
+    owned_device_id, owned_room_id, owned_user_id,
 };
 use serde::Serialize;
 
@@ -38,6 +39,9 @@ pub enum User {
     Bob,
     /// `@carol:other.server`
     Carol,
+    /// The default user ID used when building a `Client` for tests,
+    /// `@example:localhost`.
+    Default,
 }
 
 /// Alice's user ID.
@@ -48,6 +52,9 @@ static BOB_USER_ID: LazyLock<OwnedUserId> = LazyLock::new(|| owned_user_id!("@bo
 /// Carol's user ID.
 static CAROL_USER_ID: LazyLock<OwnedUserId> =
     LazyLock::new(|| owned_user_id!("@carol:other.server"));
+/// Default user ID.
+static DEFAULT_USER_ID: LazyLock<OwnedUserId> =
+    LazyLock::new(|| owned_user_id!("@example:localhost"));
 
 impl User {
     /// The user's ID.
@@ -59,6 +66,7 @@ impl User {
             User::Alice => &ALICE_USER_ID,
             User::Bob => &BOB_USER_ID,
             User::Carol => &CAROL_USER_ID,
+            User::Default => &DEFAULT_USER_ID,
         }
     }
 
@@ -179,6 +187,8 @@ impl fmt::Display for User {
 ///
 /// - `&'static RoomId`
 /// - `OwnedRoomId`
+/// - `&'static RoomOrAliasId`
+/// - `OwnedRoomOrAliasId`
 ///
 /// It implements `PartialEq` with all the ID types above, as well as with
 /// `serde_json::Value` to use with the `assert_eq!` macro.
@@ -186,7 +196,7 @@ impl fmt::Display for User {
 /// It implements `Serialize` and `Into<String>` to use it with the `json!`
 /// macro.
 ///
-/// It implements `Hash` and `Equivalent<OwnedUserId>` as well to be able to use
+/// It implements `Hash` and `Equivalent<OwnedRoomId>` as well to be able to use
 /// it with methods like `IndexMap::get()` or `IndexMap::contains_key()`.
 ///
 /// It can also be converted to a borrowed string with `.as_str()` to use it
@@ -200,6 +210,15 @@ pub enum TestRoom {
     /// A room with an ID using the format introduced in room version 12,
     /// `!2n76rSaCoTdcb1-zm9dcLm0laKJnuPyE80mopRnYgmg`.
     V12,
+
+    /// Another room ID, `!another_room:homeserver.localhost`.
+    Other,
+
+    /// An ID for an invited room, `!invited:matrix.local`.
+    Invited,
+
+    /// An ID for a room that was left, `!left:matrix.local`.
+    Left,
 }
 
 /// Default room ID.
@@ -208,6 +227,14 @@ static DEFAULT_ROOM_ID: LazyLock<OwnedRoomId> =
 /// V12 room ID.
 static V12_ROOM_ID: LazyLock<OwnedRoomId> =
     LazyLock::new(|| owned_room_id!("!2n76rSaCoTdcb1-zm9dcLm0laKJnuPyE80mopRnYgmg"));
+/// Another room ID.
+static OTHER_ROOM_ID: LazyLock<OwnedRoomId> =
+    LazyLock::new(|| owned_room_id!("!another_room:homeserver.localhost"));
+/// Invited room ID.
+static INVITED_ROOM_ID: LazyLock<OwnedRoomId> =
+    LazyLock::new(|| owned_room_id!("!invited:matrix.local"));
+/// Left room ID.
+static LEFT_ROOM_ID: LazyLock<OwnedRoomId> = LazyLock::new(|| owned_room_id!("!left:matrix.local"));
 
 impl TestRoom {
     /// The room's ID.
@@ -218,6 +245,9 @@ impl TestRoom {
         match self {
             Self::Default => &DEFAULT_ROOM_ID,
             Self::V12 => &V12_ROOM_ID,
+            Self::Other => &OTHER_ROOM_ID,
+            Self::Invited => &INVITED_ROOM_ID,
+            Self::Left => &LEFT_ROOM_ID,
         }
     }
 
@@ -327,6 +357,163 @@ impl Serialize for TestRoom {
 }
 
 impl fmt::Display for TestRoom {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.id().fmt(f)
+    }
+}
+
+/// A Matrix test device.
+///
+/// This can be converted to the following types with `.into()`:
+///
+/// - `&'static DeviceId`
+/// - `OwnedDeviceId`
+///
+/// It implements `PartialEq` with all the ID types above, as well as with
+/// `serde_json::Value` to use with the `assert_eq!` macro.
+///
+/// It implements `Serialize` and `Into<String>` to use it with the `json!`
+/// macro.
+///
+/// It implements `Hash` and `Equivalent<OwnedDeviceId>` as well to be able to
+/// use it with methods like `IndexMap::get()` or `IndexMap::contains_key()`.
+///
+/// It can also be converted to a borrowed string with `.as_str()` to use it
+/// with methods like `HashMap::get()` or `HashSet::contains()`.
+#[derive(Debug, Default, Clone, Copy)]
+pub enum TestDevice {
+    /// The default device ID, `MYD3V1C31D`.
+    #[default]
+    Default,
+
+    /// The first alternative device ID, `JLAFKJWSCS`.
+    Alt1,
+
+    /// The second alternative device ID, `ILMLKASTES`.
+    Alt2,
+
+    /// The third alternative device ID, `WSKKLTJZCL`.
+    Alt3,
+}
+
+/// Default device ID.
+static DEFAULT_DEVICE_ID: LazyLock<OwnedDeviceId> =
+    LazyLock::new(|| owned_device_id!("MYD3V1C31D"));
+/// First alternative device ID.
+static ALT1_DEVICE_ID: LazyLock<OwnedDeviceId> = LazyLock::new(|| owned_device_id!("JLAFKJWSCS"));
+/// Second alternative device ID.
+static ALT2_DEVICE_ID: LazyLock<OwnedDeviceId> = LazyLock::new(|| owned_device_id!("ILMLKASTES"));
+/// Third alternative device ID.
+static ALT3_DEVICE_ID: LazyLock<OwnedDeviceId> = LazyLock::new(|| owned_device_id!("WSKKLTJZCL"));
+
+impl TestDevice {
+    /// The device's ID.
+    ///
+    /// This unconventional return type allows to either clone the owned ID or
+    /// dereference it.
+    fn id(&self) -> &'static OwnedDeviceId {
+        match self {
+            Self::Default => &DEFAULT_DEVICE_ID,
+            Self::Alt1 => &ALT1_DEVICE_ID,
+            Self::Alt2 => &ALT2_DEVICE_ID,
+            Self::Alt3 => &ALT3_DEVICE_ID,
+        }
+    }
+
+    /// The room's ID as a `&str`.
+    pub fn as_str(&self) -> &'static str {
+        self.id().as_str()
+    }
+}
+
+impl From<TestDevice> for OwnedDeviceId {
+    fn from(device: TestDevice) -> Self {
+        device.id().clone()
+    }
+}
+
+impl From<TestDevice> for &'static DeviceId {
+    fn from(device: TestDevice) -> Self {
+        device.id()
+    }
+}
+
+impl From<TestDevice> for String {
+    fn from(device: TestDevice) -> Self {
+        device.as_str().to_owned()
+    }
+}
+
+impl PartialEq<OwnedDeviceId> for TestDevice {
+    fn eq(&self, other: &OwnedDeviceId) -> bool {
+        self.id().eq(other)
+    }
+}
+
+impl PartialEq<TestDevice> for OwnedDeviceId {
+    fn eq(&self, other: &TestDevice) -> bool {
+        self.eq(other.id())
+    }
+}
+
+impl PartialEq<&OwnedDeviceId> for TestDevice {
+    fn eq(&self, other: &&OwnedDeviceId) -> bool {
+        self.id().eq(*other)
+    }
+}
+
+impl PartialEq<TestDevice> for &OwnedDeviceId {
+    fn eq(&self, other: &TestDevice) -> bool {
+        (*self).eq(other.id())
+    }
+}
+
+impl PartialEq<&DeviceId> for TestDevice {
+    fn eq(&self, other: &&DeviceId) -> bool {
+        self.id().eq(other)
+    }
+}
+
+impl PartialEq<TestDevice> for &DeviceId {
+    fn eq(&self, other: &TestDevice) -> bool {
+        self.eq(other.id())
+    }
+}
+
+impl PartialEq<serde_json::Value> for TestDevice {
+    fn eq(&self, other: &serde_json::Value) -> bool {
+        self.as_str().eq(other)
+    }
+}
+
+impl PartialEq<TestDevice> for serde_json::Value {
+    fn eq(&self, other: &TestDevice) -> bool {
+        self.eq(other.as_str())
+    }
+}
+
+impl Equivalent<OwnedDeviceId> for TestDevice {
+    fn equivalent(&self, key: &OwnedDeviceId) -> bool {
+        key.eq(self.id())
+    }
+}
+
+impl Hash for TestDevice {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id().hash(state);
+    }
+}
+
+impl Serialize for TestDevice {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.id().serialize(serializer)
+    }
+}
+
+impl fmt::Display for TestDevice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.id().fmt(f)
     }

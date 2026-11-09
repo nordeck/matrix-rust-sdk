@@ -29,7 +29,7 @@ use matrix_sdk_base::deserialized_responses::TimelineEvent;
 use matrix_sdk_base::recent_emojis::RecentEmojisContent;
 use matrix_sdk_test::{
     InvitedRoomBuilder, JoinedRoomBuilder, KnockedRoomBuilder, LeftRoomBuilder,
-    SyncResponseBuilder, event_factory::EventFactory, test_json,
+    SyncResponseBuilder, User, event_factory::EventFactory, test_json,
 };
 use percent_encoding::{AsciiSet, CONTROLS};
 use ruma::{
@@ -40,8 +40,8 @@ use ruma::{
             discovery::get_capabilities::v3::Capabilities,
             receipt::create_receipt::v3::ReceiptType,
             room::Visibility,
-            sync::sync_events::v5,
-            threads::get_thread_subscriptions_changes::unstable::{
+            sync::sync_events::msc4186,
+            threads::get_thread_subscriptions_changes::msc4308::{
                 ThreadSubscription, ThreadUnsubscription,
             },
             uiaa,
@@ -52,8 +52,8 @@ use ruma::{
     directory::PublicRoomsChunk,
     encryption::{CrossSigningKey, DeviceKeys, OneTimeKey},
     events::{
-        AnyStateEvent, AnySyncTimelineEvent, AnyTimelineEvent, GlobalAccountDataEventType,
-        MessageLikeEventType, RoomAccountDataEventType, StateEventType,
+        AnyGlobalAccountDataEventContent, AnyStateEvent, AnySyncTimelineEvent, AnyTimelineEvent,
+        GlobalAccountDataEventType, MessageLikeEventType, RoomAccountDataEventType, StateEventType,
         receipt::ReceiptThread,
         room::member::{MembershipState, RoomMemberEvent},
         tag::TagName,
@@ -64,7 +64,6 @@ use ruma::{
     push::RuleKind,
     serde::{JsonObject, Raw},
     time::Duration,
-    user_id,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, from_value, json};
@@ -82,7 +81,9 @@ pub mod encryption;
 pub mod oauth;
 
 use super::client::MockClientBuilder;
-use crate::{Client, OwnedServerName, Room, SlidingSyncBuilder, room::IncludeRelations};
+use crate::{
+    Client, OwnedServerName, Room, SlidingSyncBuilder, room::IncludeRelations, sync::SyncResponse,
+};
 
 /// Structure used to store the crypto keys uploaded to the server. They will be
 /// served back to clients when requested.
@@ -304,7 +305,7 @@ impl MatrixMockServer {
     ///     .await;
     /// # anyhow::Ok(()) });
     /// ```
-    pub async fn sync_joined_room(&self, client: &Client, room_id: &RoomId) -> Room {
+    pub async fn sync_joined_room(&self, client: &Client, room_id: impl Into<OwnedRoomId>) -> Room {
         self.sync_room(client, JoinedRoomBuilder::new(room_id)).await
     }
 
@@ -765,7 +766,13 @@ impl MatrixMockServer {
         self.mock_endpoint(mock, RemoveRoomAliasEndpoint)
     }
 
-    /// Create a prebuilt mock for listing public rooms.
+    /// Create a prebuilt mock for listing all public rooms.
+    pub fn mock_get_all_public_rooms(&self) -> MockEndpoint<'_, PublicRoomsEndpoint> {
+        let mock = Mock::given(method("GET")).and(path("/_matrix/client/v3/publicRooms"));
+        self.mock_endpoint(mock, PublicRoomsEndpoint)
+    }
+
+    /// Create a prebuilt mock for listing filtered public rooms.
     ///
     /// # Examples
     ///
@@ -791,7 +798,7 @@ impl MatrixMockServer {
     ///     guest_can_join: true,
     /// }.into()];
     ///
-    /// mock_server.mock_public_rooms().ok(chunk, None, None, Some(20)).mock_once().mount().await;
+    /// mock_server.mock_get_filtered_public_rooms().ok(chunk, None, None, Some(20)).mock_once().mount().await;
     /// let mut room_directory_search = RoomDirectorySearch::new(client);
     ///
     /// room_directory_search.search(Some("some-alias".to_owned()), 100, None)
@@ -803,8 +810,8 @@ impl MatrixMockServer {
     /// assert_eq!(results.get(0).unwrap().room_id, room_id.to_owned());
     /// # });
     /// ```
-    pub fn mock_public_rooms(&self) -> MockEndpoint<'_, PublicRoomsEndpoint> {
-        let mock = Mock::given(method("POST")).and(path_regex(r"/_matrix/client/v3/publicRooms"));
+    pub fn mock_get_filtered_public_rooms(&self) -> MockEndpoint<'_, PublicRoomsEndpoint> {
+        let mock = Mock::given(method("POST")).and(path("/_matrix/client/v3/publicRooms"));
         self.mock_endpoint(mock, PublicRoomsEndpoint)
     }
 
@@ -1174,8 +1181,7 @@ impl MatrixMockServer {
     /// If no access token is provided, the access token to match is `"1234"`,
     /// which matches the default value in the mock data.
     pub fn mock_who_am_i(&self) -> MockEndpoint<'_, WhoAmIEndpoint> {
-        let mock =
-            Mock::given(method("GET")).and(path_regex(r"^/_matrix/client/v3/account/whoami"));
+        let mock = Mock::given(method("GET")).and(path("/_matrix/client/v3/account/whoami"));
         self.mock_endpoint(mock, WhoAmIEndpoint).expect_default_access_token()
     }
 
@@ -1553,12 +1559,21 @@ impl MatrixMockServer {
         self.mock_endpoint(mock, GetDeviceEndpoint).expect_default_access_token()
     }
 
+    /// Create a prebuilt mock for the endpoint used to delete several devices.
+    pub fn mock_delete_devices(&self) -> MockEndpoint<'_, DeleteDevicesEndpoint> {
+        let mock = Mock::given(method("POST")).and(path("/_matrix/client/v3/delete_devices"));
+        self.mock_endpoint(mock, DeleteDevicesEndpoint).expect_default_access_token()
+    }
+
     /// Create a prebuilt mock for the endpoint used to search in the user
     /// directory.
     pub fn mock_user_directory(&self) -> MockEndpoint<'_, UserDirectoryEndpoint> {
         let mock = Mock::given(method("POST"))
             .and(path("/_matrix/client/v3/user_directory/search"))
-            .and(body_json(&*test_json::search_users::SEARCH_USERS_REQUEST));
+            .and(body_json(json!({
+                "search_term": "test",
+                "limit": 50
+            })));
         self.mock_endpoint(mock, UserDirectoryEndpoint).expect_default_access_token()
     }
 
@@ -1832,6 +1847,14 @@ impl MatrixMockServer {
         self.mock_endpoint(mock, GetProfileEndpoint)
     }
 
+    /// Create a prebuilt mock for the endpoint used to query the profiles of
+    /// multiple users (MSC4536).
+    pub fn mock_query_profiles(&self) -> MockEndpoint<'_, QueryProfilesEndpoint> {
+        let mock = Mock::given(method("POST"))
+            .and(path("/_matrix/client/unstable/org.matrix.msc4536/profile/query"));
+        self.mock_endpoint(mock, QueryProfilesEndpoint).expect_default_access_token()
+    }
+
     /// Create a prebuilt mock for the endpoint used to get the capabilities of
     /// the homeserver.
     pub fn mock_get_homeserver_capabilities(
@@ -1887,6 +1910,30 @@ impl MatrixMockServer {
         let mock = Mock::given(method("GET"))
             .and(path("/_matrix/client/unstable/org.matrix.msc4143/rtc/transports"));
         self.mock_endpoint(mock, GetRtcTransportsEndpoint)
+    }
+
+    /// Creates a prebuilt mock for getting global account data.
+    pub fn mock_get_global_account_data(
+        &self,
+        user_id: &UserId,
+        account_data_type: &GlobalAccountDataEventType,
+    ) -> MockEndpoint<'_, GetGlobalAccountDataEndpoint> {
+        let mock = Mock::given(method("GET")).and(path(format!(
+            "/_matrix/client/v3/user/{user_id}/account_data/{account_data_type}"
+        )));
+        self.mock_endpoint(mock, GetGlobalAccountDataEndpoint).expect_default_access_token()
+    }
+
+    /// Creates a prebuilt mock for setting global account data.
+    pub fn mock_set_global_account_data(
+        &self,
+        user_id: &UserId,
+        account_data_type: &GlobalAccountDataEventType,
+    ) -> MockEndpoint<'_, SetGlobalAccountDataEndpoint> {
+        let mock = Mock::given(method("PUT")).and(path(format!(
+            "/_matrix/client/v3/user/{user_id}/account_data/{account_data_type}"
+        )));
+        self.mock_endpoint(mock, SetGlobalAccountDataEndpoint).expect_default_access_token()
     }
 }
 
@@ -2134,6 +2181,18 @@ impl<'a, T> MockEndpoint<'a, T> {
         self
     }
 
+    /// Ensures that the body of the request is a superset of the provided
+    /// `body` parameter.
+    pub fn body_matches_partial_json(self, body: impl Serialize) -> Self {
+        Self { mock: self.mock.and(body_partial_json(body)), ..self }
+    }
+
+    /// Ensures that the body of the request is the exact provided `body`
+    /// parameter.
+    pub fn body_json(self, body: impl Serialize) -> Self {
+        Self { mock: self.mock.and(body_json(body)), ..self }
+    }
+
     /// Specify how to respond to a query (viz., like
     /// [`MockBuilder::respond_with`] does), when other predefined responses
     /// aren't sufficient.
@@ -2337,6 +2396,25 @@ impl<'a, T> MockEndpoint<'a, T> {
             }),
         )
     }
+
+    /// Returns a mocked endpoint that emulates a User-Interactive
+    /// Authentication with a password stage.
+    pub fn error_uiaa_password(self) -> MatrixMock<'a> {
+        self.respond_with_code_and_json(
+            401,
+            json!({
+                "flows": [
+                    {
+                        "stages": [
+                            "m.login.password"
+                        ]
+                    }
+                ],
+                "params": {},
+                "session": "oFIJVvtEOCKmRUTYKTYIIPHL"
+            }),
+        )
+    }
 }
 
 /// The access token to expect on an endpoint.
@@ -2417,53 +2495,6 @@ impl<'a> MockEndpoint<'a, RoomSendEndpoint> {
             mock: self.mock.and(query_param_is_missing("org.matrix.msc4354.sticky_duration_ms")),
             ..self
         }
-    }
-
-    /// Ensures that the body of the request is a superset of the provided
-    /// `body` parameter.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # tokio_test::block_on(async {
-    /// use matrix_sdk::{
-    ///     ruma::{room_id, event_id, events::room::message::RoomMessageEventContent},
-    ///     test_utils::mocks::MatrixMockServer
-    /// };
-    /// use serde_json::json;
-    ///
-    /// let mock_server = MatrixMockServer::new().await;
-    /// let client = mock_server.client_builder().build().await;
-    ///
-    /// mock_server.mock_room_state_encryption().plain().mount().await;
-    ///
-    /// let room = mock_server
-    ///     .sync_joined_room(&client, room_id!("!room_id:localhost"))
-    ///     .await;
-    ///
-    /// let event_id = event_id!("$some_id");
-    /// mock_server
-    ///     .mock_room_send()
-    ///     .body_matches_partial_json(json!({
-    ///         "body": "Hello world",
-    ///     }))
-    ///     .ok(event_id)
-    ///     .expect(1)
-    ///     .mount()
-    ///     .await;
-    ///
-    /// let content = RoomMessageEventContent::text_plain("Hello world");
-    /// let result = room.send(content).await?;
-    ///
-    /// assert_eq!(
-    ///     event_id,
-    ///     result.response.event_id,
-    ///     "The event ID we mocked should match the one we received when we sent the event"
-    /// );
-    /// # anyhow::Ok(()) });
-    /// ```
-    pub fn body_matches_partial_json(self, body: Value) -> Self {
-        Self { mock: self.mock.and(body_partial_json(body)), ..self }
     }
 
     /// Ensures that the send endpoint request uses a specific event type.
@@ -2634,7 +2665,7 @@ impl<'a> MockEndpoint<'a, RoomSendEndpoint> {
     /// // A non delayed event should not be mocked by the server.
     /// assert!(response_not_mocked.is_err());
     ///
-    /// let r = delayed_message_event::unstable::Request::new(
+    /// let r = delayed_message_event::msc4140::Request::new(
     ///     room.room_id().to_owned(),
     ///     TransactionId::new(),
     ///     DelayParameters::Timeout { timeout: Duration::from_millis(500) },
@@ -2810,61 +2841,6 @@ impl<'a> MockEndpoint<'a, RoomSendStateEndpoint> {
         )
     }
 
-    /// Ensures that the body of the request is a superset of the provided
-    /// `body` parameter.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # tokio_test::block_on(async {
-    /// use matrix_sdk::{
-    ///     ruma::{
-    ///         room_id, event_id,
-    ///         events::room::power_levels::RoomPowerLevelsEventContent,
-    ///         room_version_rules::AuthorizationRules
-    ///     },
-    ///     test_utils::mocks::MatrixMockServer
-    /// };
-    /// use serde_json::json;
-    ///
-    /// let mock_server = MatrixMockServer::new().await;
-    /// let client = mock_server.client_builder().build().await;
-    ///
-    /// mock_server.mock_room_state_encryption().plain().mount().await;
-    ///
-    /// let room = mock_server
-    ///     .sync_joined_room(&client, room_id!("!room_id:localhost"))
-    ///     .await;
-    ///
-    /// let event_id = event_id!("$some_id");
-    /// mock_server
-    ///     .mock_room_send_state()
-    ///     .body_matches_partial_json(json!({
-    ///         "redact": 51,
-    ///     }))
-    ///     .ok(event_id)
-    ///     .expect(1)
-    ///     .mount()
-    ///     .await;
-    ///
-    /// let mut content = RoomPowerLevelsEventContent::new(&AuthorizationRules::V1);
-    /// // Update the power level to a non default value.
-    /// // Otherwise it will be skipped from serialization.
-    /// content.redact = 51.into();
-    ///
-    /// let response = room.send_state_event(content).await?;
-    ///
-    /// assert_eq!(
-    ///     event_id,
-    ///     response.event_id,
-    ///     "The event ID we mocked should match the one we received when we sent the event"
-    /// );
-    /// # anyhow::Ok(()) });
-    /// ```
-    pub fn body_matches_partial_json(self, body: Value) -> Self {
-        Self { mock: self.mock.and(body_partial_json(body)), ..self }
-    }
-
     /// Ensures that the send endpoint request uses a specific event type.
     ///
     /// Note: works with _any_ room.
@@ -2970,7 +2946,7 @@ impl<'a> MockEndpoint<'a, RoomSendStateEndpoint> {
     /// // A non delayed event should not be mocked by the server.
     /// assert!(response_not_mocked.is_err());
     ///
-    /// let r = delayed_state_event::unstable::Request::new(
+    /// let r = delayed_state_event::msc4140::Request::new(
     ///     room.room_id().to_owned(),
     ///     "".to_owned(),
     ///     DelayParameters::Timeout { timeout: Duration::from_millis(500) },
@@ -3164,9 +3140,21 @@ impl<'a> MockEndpoint<'a, SyncEndpoint> {
     /// # anyhow::Ok(()) });
     /// ```
     pub async fn ok_and_run<F: FnOnce(&mut SyncResponseBuilder)>(self, client: &Client, func: F) {
+        self.ok_and_run_with_response(client, func).await;
+    }
+
+    /// Temporarily mocks the sync with the given endpoint, runs a client
+    /// sync with it and returns the response.
+    ///
+    /// After calling this function, the sync endpoint isn't mocked anymore.
+    pub async fn ok_and_run_with_response<F: FnOnce(&mut SyncResponseBuilder)>(
+        self,
+        client: &Client,
+        func: F,
+    ) -> SyncResponse {
         let _scope = self.ok(func).mount_as_scoped().await;
 
-        let _response = client.sync_once(Default::default()).await.unwrap();
+        client.sync_once(Default::default()).await.unwrap()
     }
 }
 
@@ -3272,6 +3260,59 @@ impl<'a> MockEndpoint<'a, SetEncryptionStateEndpoint> {
 pub struct RoomRedactEndpoint;
 
 impl<'a> MockEndpoint<'a, RoomRedactEndpoint> {
+    /// Only match a request that contains a specific `event_id` in its path.
+    ///
+    /// Without this, the mock would match the redaction of any event.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # tokio_test::block_on(async {
+    /// use matrix_sdk::{
+    ///     ruma::{event_id, room_id},
+    ///     test_utils::mocks::MatrixMockServer,
+    /// };
+    ///
+    /// let mock_server = MatrixMockServer::new().await;
+    /// let client = mock_server.client_builder().build().await;
+    ///
+    /// let redacted = event_id!("$redacted");
+    /// let other = event_id!("$other");
+    ///
+    /// // This mock only answers redactions of `other`, so it's never hit.
+    /// mock_server
+    ///     .mock_room_redact()
+    ///     .match_event_id(other)
+    ///     .ok(event_id!("$other_redaction"))
+    ///     .never()
+    ///     .mount()
+    ///     .await;
+    /// mock_server
+    ///     .mock_room_redact()
+    ///     .match_event_id(redacted)
+    ///     .ok(event_id!("$redaction"))
+    ///     .mock_once()
+    ///     .mount()
+    ///     .await;
+    ///
+    /// let room = mock_server
+    ///     .sync_joined_room(&client, room_id!("!room_id:localhost"))
+    ///     .await;
+    ///
+    /// let response = room.redact(redacted, None, None).await?;
+    /// assert_eq!(response.event_id, event_id!("$redaction"));
+    /// # anyhow::Ok(()) });
+    /// ```
+    pub fn match_event_id(self, event_id: &EventId) -> Self {
+        Self {
+            mock: self.mock.and(path_regex(format!(
+                r"^/_matrix/client/v3/rooms/.*/redact/{}/",
+                regex::escape(event_id.as_str())
+            ))),
+            ..self
+        }
+    }
+
     /// Returns a redact endpoint that emulates success, i.e. the redaction
     /// event has been sent with the given event id.
     pub fn ok(self, returned_event_id: impl Into<OwnedEventId>) -> MatrixMock<'a> {
@@ -3665,6 +3706,11 @@ impl<'a> MockEndpoint<'a, PublicRoomsEndpoint> {
             }))
         })
     }
+
+    /// Returns an endpoint with a default successful response.
+    pub fn ok_default(self) -> MatrixMock<'a> {
+        self.ok_json(&*test_json::PUBLIC_ROOMS)
+    }
 }
 
 /// A prebuilt mock for getting the room's visibility in the room directory.
@@ -3939,6 +3985,12 @@ impl<'a> MockEndpoint<'a, VersionsEndpoint> {
         self.with_feature("org.matrix.msc4262", true)
     }
 
+    /// Indicate that querying multiple profiles (MSC4536) is supported by this
+    /// homeserver.
+    pub fn with_query_profiles(self) -> Self {
+        self.with_feature("org.matrix.msc4536", true)
+    }
+
     /// Indicate that sticky events (MSC4354) are supported by this homeserver.
     pub fn with_sticky_events(self) -> Self {
         self.with_feature("org.matrix.msc4354", true)
@@ -4022,25 +4074,29 @@ pub struct WhoAmIEndpoint;
 impl<'a> MockEndpoint<'a, WhoAmIEndpoint> {
     /// Returns a successful response with the default user ID and device ID.
     pub fn ok(self) -> MatrixMock<'a> {
-        self.ok_with_ids(user_id!("@joe:example.org"), device_id!("D3V1C31D"))
+        self.ok_with_ids(User::Alice, device_id!("D3V1C31D"))
     }
 
     /// Returns a successful response with the given user ID, and the default
     /// device ID.
-    pub fn ok_with_user_id(self, user_id: &UserId) -> MatrixMock<'a> {
+    pub fn ok_with_user_id<'b>(self, user_id: impl Into<&'b UserId>) -> MatrixMock<'a> {
         self.ok_with_ids(user_id, device_id!("D3V1C31D"))
     }
 
     /// Returns a successful response with the given device ID, and the default
     /// user ID.
     pub fn ok_with_device_id(self, device_id: &DeviceId) -> MatrixMock<'a> {
-        self.ok_with_ids(user_id!("@joe:example.org"), device_id)
+        self.ok_with_ids(User::Alice, device_id)
     }
 
     /// Returns a successful response with the given user ID and device ID.
-    fn ok_with_ids(self, user_id: &UserId, device_id: &DeviceId) -> MatrixMock<'a> {
+    fn ok_with_ids<'b>(
+        self,
+        user_id: impl Into<&'b UserId>,
+        device_id: &DeviceId,
+    ) -> MatrixMock<'a> {
         self.ok_json(json!({
-            "user_id": user_id,
+            "user_id": user_id.into(),
             "device_id": device_id,
         }))
     }
@@ -4130,24 +4186,6 @@ impl<'a> MockEndpoint<'a, UploadCrossSigningKeysEndpoint> {
             json!({
                 "errcode": "M_FORBIDDEN",
                 "error": "Invalid password",
-                "flows": [
-                    {
-                        "stages": [
-                            "m.login.password"
-                        ]
-                    }
-                ],
-                "params": {},
-                "session": "oFIJVvtEOCKmRUTYKTYIIPHL"
-            }),
-        )
-    }
-
-    /// Returns an error response with a UIAA stage.
-    pub fn uiaa(self) -> MatrixMock<'a> {
-        self.respond_with_code_and_json(
-            401,
-            json!({
                 "flows": [
                     {
                         "stages": [
@@ -4665,18 +4703,6 @@ impl<'a> MockEndpoint<'a, ReceiptEndpoint> {
         self.ok_empty_json()
     }
 
-    /// Ensures that the body of the request is a superset of the provided
-    /// `body` parameter.
-    pub fn body_matches_partial_json(self, body: Value) -> Self {
-        Self { mock: self.mock.and(body_partial_json(body)), ..self }
-    }
-
-    /// Ensures that the body of the request is the exact provided `body`
-    /// parameter.
-    pub fn body_json(self, body: Value) -> Self {
-        Self { mock: self.mock.and(body_json(body)), ..self }
-    }
-
     /// Ensures that the request matches a specific receipt thread.
     pub fn match_thread(self, thread: ReceiptThread) -> Self {
         if let Some(thread_str) = thread.as_str() {
@@ -4838,12 +4864,6 @@ impl<'a> MockEndpoint<'a, LoginEndpoint> {
             }),
         }))
     }
-
-    /// Ensures that the body of the request is a superset of the provided
-    /// `body` parameter.
-    pub fn body_matches_partial_json(self, body: Value) -> Self {
-        Self { mock: self.mock.and(body_partial_json(body)), ..self }
-    }
 }
 
 #[derive(Default)]
@@ -4927,7 +4947,24 @@ pub struct DevicesEndpoint;
 impl<'a> MockEndpoint<'a, DevicesEndpoint> {
     /// Returns a successful response.
     pub fn ok(self) -> MatrixMock<'a> {
-        self.ok_json(&*test_json::DEVICES)
+        self.ok_json(json!({
+            "devices": [
+                {
+                    "device_id": "BNYQQWUMXO",
+                    "display_name": "Client 1",
+                    "last_seen_ip": "-",
+                    "last_seen_ts": 1596117733037u64,
+                    "user_id": "@example:localhost"
+                },
+                {
+                    "device_id": "LEBKSEUSNR",
+                    "display_name": "Client 2",
+                    "last_seen_ip": "-",
+                    "last_seen_ts": 1599057006985u64,
+                    "user_id": "@example:localhost"
+                }
+            ]
+        }))
     }
 }
 
@@ -4937,7 +4974,22 @@ pub struct GetDeviceEndpoint;
 impl<'a> MockEndpoint<'a, GetDeviceEndpoint> {
     /// Returns a successful response.
     pub fn ok(self) -> MatrixMock<'a> {
-        self.ok_json(&*test_json::DEVICE)
+        self.ok_json(json!({
+            "device_id": "QBUAZIFURK",
+            "display_name": "android",
+            "last_seen_ip": "1.2.3.4",
+            "last_seen_ts": 1474491775024u64
+        }))
+    }
+}
+
+/// A prebuilt mock for the `POST /_matrix/client/v3/delete_devices` endpoint.
+pub struct DeleteDevicesEndpoint;
+
+impl<'a> MockEndpoint<'a, DeleteDevicesEndpoint> {
+    /// Returns a successful empty response.
+    pub fn ok(self) -> MatrixMock<'a> {
+        self.ok_empty_json()
     }
 }
 
@@ -4947,7 +4999,16 @@ pub struct UserDirectoryEndpoint;
 impl<'a> MockEndpoint<'a, UserDirectoryEndpoint> {
     /// Returns a successful response.
     pub fn ok(self) -> MatrixMock<'a> {
-        self.ok_json(&*test_json::search_users::SEARCH_USERS_RESPONSE)
+        self.ok_json(json!({
+            "limited": false,
+            "results": [
+                {
+                    "user_id": "@test:example.me",
+                    "display_name": "Test",
+                    "avatar_url": "mxc://example.me/someid"
+                }
+            ]
+        }))
     }
 }
 
@@ -5531,7 +5592,7 @@ pub struct SlidingSyncEndpoint;
 
 impl<'a> MockEndpoint<'a, SlidingSyncEndpoint> {
     /// Mocks the sliding sync endpoint with the given response.
-    pub fn ok(self, response: v5::Response) -> MatrixMock<'a> {
+    pub fn ok(self, response: msc4186::Response) -> MatrixMock<'a> {
         // A bit silly that we need to destructure all the fields ourselves, but
         // Response isn't serializable :'(
         self.ok_json(json!({
@@ -5551,7 +5612,7 @@ impl<'a> MockEndpoint<'a, SlidingSyncEndpoint> {
         self,
         client: &Client,
         on_builder: F,
-        response: v5::Response,
+        response: msc4186::Response,
     ) {
         let _scope = self.ok(response).mount_as_scoped().await;
 
@@ -5622,6 +5683,35 @@ impl<'a> MockEndpoint<'a, GetProfileEndpoint> {
     }
 }
 
+/// A prebuilt mock for `POST /_matrix/client/*/profile/query` (MSC4536).
+pub struct QueryProfilesEndpoint;
+
+impl<'a> MockEndpoint<'a, QueryProfilesEndpoint> {
+    /// Expect the request to query exactly the given users, in that order.
+    pub fn expect_users(mut self, users: &[OwnedUserId]) -> Self {
+        self.mock = self.mock.and(body_json(json!({ "users": users })));
+        self
+    }
+
+    /// Returns a successful response containing the given profiles.
+    pub fn ok_with_profiles(
+        self,
+        profiles: Vec<(OwnedUserId, Vec<ProfileFieldValue>)>,
+    ) -> MatrixMock<'a> {
+        let profiles = profiles
+            .into_iter()
+            .map(|(user_id, fields)| {
+                let profile = fields
+                    .iter()
+                    .map(|field| (field.field_name(), field.value()))
+                    .collect::<BTreeMap<_, _>>();
+                (user_id, json!(profile))
+            })
+            .collect::<BTreeMap<_, _>>();
+        self.ok_json(profiles)
+    }
+}
+
 /// A prebuilt mock for `GET /_matrix/client/*/capabilities`.
 pub struct GetHomeserverCapabilitiesEndpoint;
 
@@ -5669,5 +5759,35 @@ impl<'a> MockEndpoint<'a, GetRtcTransportsEndpoint> {
                 { "type": "livekit", "livekit_service_url": "https://livekit.example.com" }
             ]
         })))
+    }
+}
+
+/// A prebuilt mock for `GET
+/// /_matrix/client/v3/user/{userId}/account_data/{type}`.
+pub struct GetGlobalAccountDataEndpoint;
+
+impl<'a> MockEndpoint<'a, GetGlobalAccountDataEndpoint> {
+    /// Returns a successful response with the given account data.
+    pub fn ok(self, account_data: impl Into<AnyGlobalAccountDataEventContent>) -> MatrixMock<'a> {
+        self.ok_json(account_data.into())
+    }
+}
+
+/// A prebuilt mock for `PUT
+/// /_matrix/client/v3/user/{userId}/account_data/{type}`.
+pub struct SetGlobalAccountDataEndpoint;
+
+impl<'a> MockEndpoint<'a, SetGlobalAccountDataEndpoint> {
+    /// Expect the request body to contain the given account data.
+    pub fn expect_account_data(
+        self,
+        account_data: impl Into<AnyGlobalAccountDataEventContent>,
+    ) -> Self {
+        self.body_json(account_data.into())
+    }
+
+    /// Returns a successful empty response.
+    pub fn ok(self) -> MatrixMock<'a> {
+        self.ok_empty_json()
     }
 }
